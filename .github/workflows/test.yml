@@ -12,6 +12,13 @@ jobs:
 
       - uses: dart-lang/setup-dart@v1
 
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Verify deno is on PATH
+        run: deno --version
+
       - name: Pub get
         run: dart pub get
 
