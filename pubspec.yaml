@@ -1,0 +1,10 @@
+name: piped_test
+description: "Piped API search + audio-URL logic ko standalone test karne ke liye — SurSathi app se bilkul alag, taaki har chhote logic change ke liye poori Flutter APK build na karni pade."
+publish_to: 'none'
+version: 1.0.0
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  http: ^1.2.2
