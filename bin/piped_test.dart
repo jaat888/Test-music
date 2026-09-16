@@ -21,6 +21,7 @@
 //
 // Run locally bhi ho sakta hai (agar kabhi PC mile): `dart run bin/piped_test.dart`
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
