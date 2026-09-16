@@ -136,29 +136,50 @@ Future<String?> _audioViaExplode(YoutubeExplode yt, String videoId) async {
     final manifest = await yt.videos.streams.getManifest(
       videoId,
       ytClients: [
+        YoutubeApiClient.androidSdkless, // known fix for 403-on-audio-only (PoToken issue)
         YoutubeApiClient.ios,
         YoutubeApiClient.androidVr,
         YoutubeApiClient.safari,
       ],
     );
+
+    // --- Diagnostic: har audio-only candidate ka status alag dikhao ---
+    // (sirf "best bitrate" try karna gumraah kar sakta hai — kabhi lower
+    // bitrate wala client kaam karta hai jab "best" wala 403 deta hai)
     final audioStreams = manifest.audioOnly;
-    if (audioStreams.isEmpty) {
-      log('  [audio/explode] no audio-only streams in manifest');
+    log('  [audio/explode] ${audioStreams.length} audio-only candidates mile, sabko check kar rahe hain:');
+    String? workingUrl;
+    for (final s in audioStreams) {
+      final ok = await verifyPlayable(s.url.toString());
+      log('    - ${s.bitrate} | ${s.container} | tag=${s.tag} -> ${ok ? "OK" : "FAIL"}');
+      if (ok && workingUrl == null) workingUrl = s.url.toString();
+    }
+
+    // --- Diagnostic: ek muxed (audio+video) stream bhi check karo ---
+    // Muxed streams alag client-path use karte hain — agar audio-only sab
+    // FAIL ho lekin muxed OK ho, to pata chalega ki issue audio-only wale
+    // PoToken-restricted streams tak hi limited hai.
+    final muxed = manifest.muxed;
+    if (muxed.isNotEmpty) {
+      final m = muxed.first;
+      final muxedOk = await verifyPlayable(m.url.toString());
+      log('  [video/explode] muxed candidate: ${m.videoQuality} | ${m.container} -> ${muxedOk ? "OK" : "FAIL"}');
+    } else {
+      log('  [video/explode] koi muxed stream nahi mila');
+    }
+
+    if (workingUrl == null) {
+      log('  [audio/explode] sab audio-only candidates FAIL (403/expired) — sambhavtah PoToken-protected video');
       return null;
     }
-    final best = audioStreams.withHighestBitrate();
-    log('  [audio/explode] best candidate: ${best.bitrate}, verifying...');
-    if (!await verifyPlayable(best.url.toString())) {
-      log('  [audio/explode] verify FAILED');
-      return null;
-    }
-    log('  [audio/explode] OK!');
-    return best.url.toString();
+    log('  [audio/explode] OK, kaam karne wala stream mila!');
+    return workingUrl;
   } catch (e) {
     log('  [audio/explode] error: $e');
     return null;
   }
 }
+
 
 // =====================================================================
 // AUDIO URL — Layer 2: Piped public instances (BACKUP, parallel race)
@@ -262,7 +283,7 @@ Future<String?> getAudioUrl(YoutubeExplode yt, String videoId) async {
 
 Future<void> main(List<String> args) async {
   final query = args.isNotEmpty ? args[0] : kTestQuery;
-  final videoId = args.length > 1 ? args[1] : kTestVideoId;
+  var videoId = args.length > 1 ? args[1] : null;
 
   var failed = false;
 
@@ -287,8 +308,15 @@ Future<void> main(List<String> args) async {
     log('RESULT: PASS — ${results.length} results, pehla: ${results.first}');
   }
 
+  // *** IMPORTANT: agar CLI se videoId nahi diya, to search ke PEHLE REAL
+  // result ka ID test karo — hardcoded "hamesha available" test video
+  // (Rick Astley) real Bollywood/label gaano jitna protected nahi hota,
+  // isliye wo PASS hoke bhi asli gaane fail hone wala bug chhupa deta tha. ***
+  videoId ??= (results.isNotEmpty ? results.first['id'] as String? : null) ??
+      kTestVideoId;
+
   log('');
-  log('===== TEST 2: getAudioUrl("$videoId") =====');
+  log('===== TEST 2: getAudioUrl("$videoId") — REAL search-result song =====');
   final url = await getAudioUrl(yt, videoId);
   if (url == null) {
     log('RESULT: FAIL — dono layers (explode + Piped backup) se playable URL nahi mila');
