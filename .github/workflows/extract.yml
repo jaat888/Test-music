@@ -1,0 +1,57 @@
+name: Extract Uploaded Zip
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.zip'
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract to temp
+        run: |
+          mkdir -p /tmp/extract
+          for z in *.zip; do
+            [ -f "$z" ] && unzip -o "$z" -d /tmp/extract && rm -f "$z"
+          done
+          rm -rf /tmp/extract/.github
+
+      - name: Flatten (agar zip ke andar ek hi top-level project folder ho)
+        run: |
+          shopt -s dotglob
+          if [ ! -f /tmp/extract/pubspec.yaml ]; then
+            for dir in /tmp/extract/*/; do
+              if [ -f "${dir}pubspec.yaml" ]; then
+                mv "${dir}"* /tmp/extract/
+                rmdir "${dir}" 2>/dev/null || true
+                break
+              fi
+            done
+          fi
+
+      - name: Clean repo (purana sab hatao, sirf .git/.github bachao)
+        run: |
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' ! -name '.github' -exec rm -rf {} +
+
+      - name: Copy fresh content
+        run: |
+          shopt -s dotglob
+          cp -r /tmp/extract/* .
+
+      - name: Commit
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "extract (clean replace)"
+          git push
+
+      - name: Trigger test workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run test.yml --ref main
