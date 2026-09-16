@@ -188,24 +188,34 @@ Future<String?> _audioViaExplode(YoutubeExplode yt, String videoId) async {
       if (ok && workingUrl == null) workingUrl = s.url.toString();
     }
 
-    // --- Diagnostic: ek muxed (audio+video) stream bhi check karo ---
-    // Muxed streams alag client-path use karte hain — agar audio-only sab
-    // FAIL ho lekin muxed OK ho, to pata chalega ki issue audio-only wale
-    // PoToken-restricted streams tak hi limited hai.
-    final muxed = manifest.muxed;
-    if (muxed.isNotEmpty) {
-      final m = muxed.first;
-      final muxedOk = await verifyPlayable(m.url.toString());
-      log('  [video/explode] muxed candidate: ${m.videoQuality} | ${m.container} -> ${muxedOk ? "OK" : "FAIL"}');
-    } else {
-      log('  [video/explode] koi muxed stream nahi mila');
-    }
-
+    // --- Fallback: agar audio-only sab FAIL, muxed (video+audio) stream try karo ---
+    // Muxed streams alag client-path use karte hain (PoToken-restricted nahi
+    // hote jaise audio-only hote hain). Player audio-only track nikaal ke
+    // play kar sakta hai — extra video data download hota hai, par kaam ho
+    // jaata hai jab audio-only URLs 403 dete hain.
     if (workingUrl == null) {
-      log('  [audio/explode] sab audio-only candidates FAIL (403/expired) — sambhavtah PoToken-protected video');
+      log('  [audio/explode] sab audio-only candidates FAIL (403/expired) — muxed fallback try kar rahe hain...');
+      final muxed = manifest.muxed;
+      if (muxed.isEmpty) {
+        log('  [video/explode] koi muxed stream nahi mila');
+        return null;
+      }
+      // lowest usable muxed pick karo (kam video-quality = kam wasted data,
+      // audio-quality muxed streams me generally fixed hoti hai)
+      final sortedMuxed = List.of(muxed)
+        ..sort((a, b) => a.size.totalBytes.compareTo(b.size.totalBytes));
+      for (final m in sortedMuxed) {
+        final ok = await verifyPlayable(m.url.toString());
+        log('    - muxed ${m.videoQuality} | ${m.container} | ${m.size.totalMegaBytes.toStringAsFixed(1)}MB -> ${ok ? "OK" : "FAIL"}');
+        if (ok) {
+          log('  [audio/explode] muxed fallback OK, isse audio nikaal ke play karo');
+          return m.url.toString();
+        }
+      }
+      log('  [audio/explode] muxed fallback bhi FAIL');
       return null;
     }
-    log('  [audio/explode] OK, kaam karne wala stream mila!');
+    log('  [audio/explode] OK, kaam karne wala audio-only stream mila!');
     return workingUrl;
   } catch (e) {
     log('  [audio/explode] error: $e');
