@@ -1,55 +1,88 @@
 // bin/piped_test.dart
 //
-// SurSathi app ke `lib/services/youtube_service.dart` ki search + audio-URL
-// resolve logic ka standalone copy — sirf testing ke liye.
+// SurSathi app ke search + audio-URL resolve logic ka standalone copy —
+// sirf testing ke liye.
 //
-// *** BADLAV (is version me): Piped public-instance racing HATA DIYA ***
-// Wajah: 2024 se YouTube ne Piped/Invidious jaise third-party frontends ko
-// datacenter-IP level par block karna shuru kar diya, aur 2026 tak ye
-// crackdown itna severe ho chuka hai ki wiki ke saare "known good" Piped
-// instances bhi ab dead/blocked hain (DNS fail, TLS cert broken, 502/526,
-// timeout — sab ek saath). Ye koi temporary outage nahi tha, structural
-// collapse hai — kitne bhi fallback instances add karo, sab isi crackdown
-// se marenge kyunki sab datacenter IPs se hi host hote hain.
+// *** ARCHITECTURE (3 LAYERS, sab independent — ek block ho to doosra try hota hai) ***
 //
-// Fix: ab hum kisi bhi third-party Piped/Invidious server par depend nahi
-// karte. `youtube_explode_dart` package seedha YouTube se extract karta hai
-// (NewPipe jaisi technique — reverse-engineered client APIs), isliye
-// "instance down" wala poora problem hi khatam ho jaata hai.
+// SEARCH:
+//   Layer 1: dart_ytmusic_api  — YT Music ka apna hi search (music_songs
+//            jaisa filter, Piped ke `filter: music_songs` se better match
+//            kyunki ye YT Music ka native ranking use karta hai).
+//   Layer 2: youtube_explode_dart search — agar YT Music search fail ho.
+//
+// AUDIO URL:
+//   Layer 1: youtube_explode_dart — seedha YouTube se extract (multiple
+//            client surfaces: ios/androidVr/safari + Deno JS-solver).
+//   Layer 2: Piped public instances (parallel race) — BACKUP. In dono me
+//            koi bhi single point of failure share nahi karta, isliye agar
+//            YouTube kal Layer 1 ka koi client block kare, Piped instances
+//            (agar kabhi wapas zinda hue) fallback ban sakte hain. NOTE:
+//            abhi (Sept 2026) ye poore ecosystem-wide down hain (dekh
+//            README/pichli test-run logs) — isliye isse "free extra try"
+//            treat karo, hard dependency nahi.
 //
 // Kyu alag repo/file: SurSathi Flutter app hai, uski APK build karke test
-// karne me 2-3 minute lagte hain har chhoti si logic change ke liye. Ye
-// script sirf plain Dart hai (koi Flutter/Android build nahi), isliye
-// GitHub Actions pe ~15-20 second me chal jaati hai.
+// karne me 2-3 minute lagte hain. Ye plain Dart script hai, GitHub Actions
+// pe ~15-20 sec me chal jaati hai.
 //
-// WORKFLOW:
-//   1. Yahan (ya SurSathi ke youtube_service.dart me) jo bhi logic change
-//      karni ho, dono jagah karo (isliye header me har baar reminder hai).
-//   2. Ye poora folder zip karke is (alag) repo me push karo — jaisa
-//      SurSathi wale repo me zip-upload se hota hai, extract.yml wahi
-//      pattern follow karta hai.
-//   3. Actions tab me "Test Piped Logic" run dekho — 15-20 sec me PASS/FAIL
-//      pata chal jaayega.
-//   4. Jab yahan PASS ho jaaye, TABHI wahi (verified) logic SurSathi ke
-//      youtube_service.dart me daal ke asli APK build karo.
-//
-// Run locally bhi ho sakta hai (agar kabhi PC mile aur Deno installed ho):
-//   dart run bin/piped_test.dart
+// WORKFLOW: (README.md me detail hai)
+//   1. Yahan aur SurSathi ke youtube_service.dart me — dono jagah change karo.
+//   2. Zip karke push karo, Actions "Test Piped Logic" dekho.
+//   3. PASS ho jaaye tabhi verified logic asli app me daalo.
 
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:http/http.dart' as http;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:youtube_explode_dart/solvers.dart';
+import 'package:dart_ytmusic_api/yt_music.dart';
 
 const String kTestQuery = 'arijit singh';
 const String kTestVideoId = 'dQw4w9WgXcQ'; // hamesha-available public video
 
 void log(String msg) => stdout.writeln(msg);
 
-// ---------------- Search ----------------
+// =====================================================================
+// SEARCH — Layer 1: dart_ytmusic_api
+// =====================================================================
 
-Future<List<Map<String, dynamic>>> search(YoutubeExplode yt, String query) async {
-  log('  [search] querying YouTube directly for "$query" ...');
+Future<List<Map<String, dynamic>>> _searchViaYtMusic(String query) async {
+  log('  [search/ytmusic] querying YT Music for "$query" ...');
+  try {
+    final ytmusic = YTMusic();
+    await ytmusic.initialize();
+    final songs = await ytmusic.searchSongs(query);
+    final list = songs
+        .take(10)
+        .map((s) => {
+              'id': s.videoId,
+              'title': s.name,
+              'author': s.artist.name,
+            })
+        .where((m) => m['id'] != null && (m['id'] as String).isNotEmpty)
+        .toList();
+    if (list.isEmpty) {
+      log('  [search/ytmusic] 0 usable results');
+      return [];
+    }
+    log('  [search/ytmusic] OK, ${list.length} results');
+    return list;
+  } catch (e) {
+    log('  [search/ytmusic] error: $e');
+    return [];
+  }
+}
+
+// =====================================================================
+// SEARCH — Layer 2: youtube_explode_dart (fallback)
+// =====================================================================
+
+Future<List<Map<String, dynamic>>> _searchViaExplode(
+    YoutubeExplode yt, String query) async {
+  log('  [search/explode] querying YouTube directly for "$query" ...');
   try {
     final results = await yt.search.getVideos(query);
     final list = results
@@ -61,15 +94,24 @@ Future<List<Map<String, dynamic>>> search(YoutubeExplode yt, String query) async
               'duration': v.duration?.inSeconds,
             })
         .toList();
-    log('  [search] OK, ${list.length} results');
+    log('  [search/explode] OK, ${list.length} results');
     return list;
   } catch (e) {
-    log('  [search] error: $e');
+    log('  [search/explode] error: $e');
     return [];
   }
 }
 
-// ---------------- Verify a candidate URL is actually fetchable ----------------
+Future<List<Map<String, dynamic>>> search(YoutubeExplode yt, String query) async {
+  final fromYtMusic = await _searchViaYtMusic(query);
+  if (fromYtMusic.isNotEmpty) return fromYtMusic;
+  log('  [search] YT Music se kuch nahi mila, explode fallback try kar rahe hain...');
+  return _searchViaExplode(yt, query);
+}
+
+// =====================================================================
+// Verify a candidate URL is actually fetchable (dono layers isse use karte hain)
+// =====================================================================
 
 Future<bool> verifyPlayable(String url) async {
   HttpClient? client;
@@ -89,16 +131,15 @@ Future<bool> verifyPlayable(String url) async {
   }
 }
 
-// ---------------- Audio URL resolve ----------------
+// =====================================================================
+// AUDIO URL — Layer 1: youtube_explode_dart
+// =====================================================================
 
-Future<String?> getAudioUrl(YoutubeExplode yt, String videoId) async {
+Future<String?> _audioViaExplode(YoutubeExplode yt, String videoId) async {
   try {
-    log('  [audio] resolving manifest for $videoId ...');
+    log('  [audio/explode] resolving manifest for $videoId ...');
     final manifest = await yt.videos.streams.getManifest(
       videoId,
-      // Multiple clients try karo taaki agar ek client challenge/block ho
-      // to doosra kaam kar jaaye — Piped-style instance-fallback ka
-      // equivalent, lekin ab YouTube ke apne alag-alag client surfaces par.
       ytClients: [
         YoutubeApiClient.ios,
         YoutubeApiClient.androidVr,
@@ -107,41 +148,137 @@ Future<String?> getAudioUrl(YoutubeExplode yt, String videoId) async {
     );
     final audioStreams = manifest.audioOnly;
     if (audioStreams.isEmpty) {
-      log('  [audio] no audio-only streams in manifest');
+      log('  [audio/explode] no audio-only streams in manifest');
       return null;
     }
     final best = audioStreams.withHighestBitrate();
-    log('  [audio] best candidate: ${best.bitrate}, verifying with real fetch...');
+    log('  [audio/explode] best candidate: ${best.bitrate}, verifying...');
     if (!await verifyPlayable(best.url.toString())) {
-      log('  [audio] verify FAILED');
+      log('  [audio/explode] verify FAILED');
       return null;
     }
-    log('  [audio] OK!');
+    log('  [audio/explode] OK!');
     return best.url.toString();
   } catch (e) {
-    log('  [audio] error: $e');
+    log('  [audio/explode] error: $e');
     return null;
   }
 }
 
-// ---------------- Main ----------------
+// =====================================================================
+// AUDIO URL — Layer 2: Piped public instances (BACKUP, parallel race)
+// =====================================================================
+//
+// Ye list abhi (Sept 2026) ecosystem-wide down hai (YouTube crackdown) —
+// isliye ise hard dependency mat samjho. Lekin free/cheap backup hai: agar
+// koi instance kabhi wapas zinda ho jaaye, ya youtube_explode_dart ka
+// koi client kal block ho jaaye, ye extra safety net ka kaam karega.
+const List<String> kPipedBackupInstances = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi-libre.kavin.rocks',
+  'https://pipedapi.tokhmi.xyz',
+  'https://pipedapi.moomoo.me',
+  'https://pipedapi.syncpundit.io',
+  'https://api-piped.mha.fi',
+  'https://piped-api.garudalinux.org',
+  'https://pipedapi.rivo.lol',
+  'https://pipedapi.leptons.xyz',
+  'https://piped-api.lunar.icu',
+  'https://ytapi.dc09.ru',
+  'https://pipedapi.colinslegacy.com',
+  'https://yapi.vyper.me',
+  'https://api.looleh.xyz',
+  'https://piped-api.cfe.re',
+  'https://pipedapi.r4fo.com',
+];
+
+final http.Client _httpClient = http.Client();
+
+Future<T?> _raceFirstSuccess<T>(
+  List<String> instances,
+  Future<T?> Function(String base) attempt,
+) async {
+  if (instances.isEmpty) return null;
+  final completer = Completer<T?>();
+  var remaining = instances.length;
+
+  for (final base in instances) {
+    attempt(base).then((result) {
+      if (completer.isCompleted) return;
+      if (result != null) {
+        completer.complete(result);
+      } else {
+        remaining--;
+        if (remaining == 0 && !completer.isCompleted) completer.complete(null);
+      }
+    }).catchError((e) {
+      if (completer.isCompleted) return;
+      remaining--;
+      if (remaining == 0 && !completer.isCompleted) completer.complete(null);
+    });
+  }
+  return completer.future;
+}
+
+Future<String?> _pipedAudioOne(String base, String videoId) async {
+  log('  [audio/piped-backup] trying $base ...');
+  try {
+    final uri = Uri.parse('$base/streams/$videoId');
+    final res = await _httpClient.get(uri).timeout(const Duration(seconds: 8));
+    if (res.statusCode != 200) {
+      log('  [audio/piped-backup] $base -> HTTP ${res.statusCode}');
+      return null;
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final audioStreams = (data['audioStreams'] as List?) ?? [];
+    if (audioStreams.isEmpty) return null;
+    final sorted = List<Map<String, dynamic>>.from(audioStreams)
+      ..sort((a, b) =>
+          ((b['bitrate'] as num?) ?? 0).compareTo((a['bitrate'] as num?) ?? 0));
+    final url = sorted.first['url'] as String?;
+    if (url == null) return null;
+    if (!await verifyPlayable(url)) {
+      log('  [audio/piped-backup] $base -> verify FAILED');
+      return null;
+    }
+    log('  [audio/piped-backup] $base -> OK!');
+    return url;
+  } catch (e) {
+    log('  [audio/piped-backup] $base -> error: $e');
+    return null;
+  }
+}
+
+Future<String?> _audioViaPipedBackup(String videoId) async {
+  log('  [audio] youtube_explode se nahi mila, Piped backup try kar rahe hain (${kPipedBackupInstances.length} instances, parallel)...');
+  return _raceFirstSuccess<String>(
+      kPipedBackupInstances, (base) => _pipedAudioOne(base, videoId));
+}
+
+Future<String?> getAudioUrl(YoutubeExplode yt, String videoId) async {
+  final viaExplode = await _audioViaExplode(yt, videoId);
+  if (viaExplode != null) return viaExplode;
+  return _audioViaPipedBackup(videoId);
+}
+
+// =====================================================================
+// Main
+// =====================================================================
 
 Future<void> main(List<String> args) async {
-  // CLI se custom query/videoId de sakte ho:
-  //   dart run bin/piped_test.dart "kishore kumar" dQw4w9WgXcQ
   final query = args.isNotEmpty ? args[0] : kTestQuery;
   final videoId = args.length > 1 ? args[1] : kTestVideoId;
 
   var failed = false;
 
-  log('===== SETUP: init Deno JS solver (kuch clients ko cipher-challenge solve karna padta hai) =====');
+  log('===== SETUP: init Deno JS solver =====');
   YoutubeExplode yt;
   try {
     final solver = await DenoEJSSolver.init();
     yt = YoutubeExplode(jsSolver: solver);
     log('  [setup] Deno solver ready');
   } catch (e) {
-    log('  [setup] Deno solver init failed ($e) — bina solver ke aage badh rahe hain (kuch streams skip ho sakte hain)');
+    log('  [setup] Deno solver init failed ($e) — bina solver ke aage badh rahe hain');
     yt = YoutubeExplode();
   }
 
@@ -149,7 +286,7 @@ Future<void> main(List<String> args) async {
   log('===== TEST 1: search("$query") =====');
   final results = await search(yt, query);
   if (results.isEmpty) {
-    log('RESULT: FAIL — 0 results');
+    log('RESULT: FAIL — dono layers (YT Music + explode) se 0 results');
     failed = true;
   } else {
     log('RESULT: PASS — ${results.length} results, pehla: ${results.first}');
@@ -159,7 +296,7 @@ Future<void> main(List<String> args) async {
   log('===== TEST 2: getAudioUrl("$videoId") =====');
   final url = await getAudioUrl(yt, videoId);
   if (url == null) {
-    log('RESULT: FAIL — playable audio URL resolve nahi hua');
+    log('RESULT: FAIL — dono layers (explode + Piped backup) se playable URL nahi mila');
     failed = true;
   } else {
     final shown = url.length > 100 ? '${url.substring(0, 100)}...' : url;
@@ -167,6 +304,7 @@ Future<void> main(List<String> args) async {
   }
 
   yt.close();
+  _httpClient.close();
 
   log('');
   if (failed) {
