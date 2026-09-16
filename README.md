@@ -1,8 +1,13 @@
 # piped-test
 
-SurSathi app se bilkul alag, chhota repo — sirf Piped search/audio-URL
+SurSathi app se bilkul alag, chhota repo — sirf YouTube search/audio-URL
 logic ko **fast** test karne ke liye (~15-20 second, poori Flutter APK
 build (2-3 min) nahi karni padti).
+
+> **Note:** Ab ye Piped public instances par depend nahi karta (wo saare
+> 2026 tak YouTube ke crackdown se dead/blocked ho chuke hain). Iski jagah
+> `youtube_explode_dart` use hota hai, jo seedha YouTube se extract karta
+> hai — koi third-party instance ki zaroorat nahi.
 
 ## Use kaise karo
 

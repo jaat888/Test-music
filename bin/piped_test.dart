@@ -1,7 +1,21 @@
 // bin/piped_test.dart
 //
-// SurSathi app ke `lib/services/youtube_service.dart` ki Piped-based
-// search + getAudioUrl logic ka standalone copy — sirf testing ke liye.
+// SurSathi app ke `lib/services/youtube_service.dart` ki search + audio-URL
+// resolve logic ka standalone copy — sirf testing ke liye.
+//
+// *** BADLAV (is version me): Piped public-instance racing HATA DIYA ***
+// Wajah: 2024 se YouTube ne Piped/Invidious jaise third-party frontends ko
+// datacenter-IP level par block karna shuru kar diya, aur 2026 tak ye
+// crackdown itna severe ho chuka hai ki wiki ke saare "known good" Piped
+// instances bhi ab dead/blocked hain (DNS fail, TLS cert broken, 502/526,
+// timeout — sab ek saath). Ye koi temporary outage nahi tha, structural
+// collapse hai — kitne bhi fallback instances add karo, sab isi crackdown
+// se marenge kyunki sab datacenter IPs se hi host hote hain.
+//
+// Fix: ab hum kisi bhi third-party Piped/Invidious server par depend nahi
+// karte. `youtube_explode_dart` package seedha YouTube se extract karta hai
+// (NewPipe jaisi technique — reverse-engineered client APIs), isliye
+// "instance down" wala poora problem hi khatam ho jaata hai.
 //
 // Kyu alag repo/file: SurSathi Flutter app hai, uski APK build karke test
 // karne me 2-3 minute lagte hain har chhoti si logic change ke liye. Ye
@@ -19,170 +33,40 @@
 //   4. Jab yahan PASS ho jaaye, TABHI wahi (verified) logic SurSathi ke
 //      youtube_service.dart me daal ke asli APK build karo.
 //
-// Run locally bhi ho sakta hai (agar kabhi PC mile): `dart run bin/piped_test.dart`
+// Run locally bhi ho sakta hai (agar kabhi PC mile aur Deno installed ho):
+//   dart run bin/piped_test.dart
 
-import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
-import 'package:http/http.dart' as http;
-
-// -------- Yahi list SurSathi ke youtube_service.dart me bhi hai — dono
-// jagah sync rakhna (instance down/naya add karna ho to dono jagah karo) --
-// Static list ab sirf LAST-RESORT fallback hai (agar dynamic fetch fail ho
-// jaaye). Purani 7-list ke 4 instances DNS-dead ho chuke the (nosebs.ru,
-// api.piped.yt, drgns.space) aur ek bug tha (list "official" nahi thi, sirf
-// jo pehle kabhi try kiya tha). Ab wiki ke current known-good instances +
-// runtime par piped-instances.kavin.rocks se live list dono use hote hain.
-const List<String> kStaticFallbackInstances = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi-libre.kavin.rocks',
-  'https://pipedapi.tokhmi.xyz',
-  'https://pipedapi.moomoo.me',
-  'https://pipedapi.syncpundit.io',
-  'https://api-piped.mha.fi',
-  'https://piped-api.garudalinux.org',
-  'https://pipedapi.rivo.lol',
-  'https://pipedapi.leptons.xyz',
-  'https://piped-api.lunar.icu',
-  'https://ytapi.dc09.ru',
-  'https://pipedapi.colinslegacy.com',
-  'https://yapi.vyper.me',
-  'https://api.looleh.xyz',
-  'https://piped-api.cfe.re',
-  'https://pipedapi.r4fo.com',
-];
-
-// Piped project khud ye endpoint maintain karta hai taaki clients hardcoded
-// list par depend na hon. Ye kabhi-kabhi khud down hota hai (502) — isliye
-// isse sirf "extra try" jaisa treat karo, hard dependency nahi.
-const String kInstanceListUrl = 'https://piped-instances.kavin.rocks/';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import 'package:youtube_explode_dart/solvers.dart';
 
 const String kTestQuery = 'arijit singh';
 const String kTestVideoId = 'dQw4w9WgXcQ'; // hamesha-available public video
 
-final http.Client _client = http.Client();
-
 void log(String msg) => stdout.writeln(msg);
-
-// ---------------- Dynamic instance list ----------------
-
-Future<List<String>> resolveInstances() async {
-  final merged = <String>{...kStaticFallbackInstances};
-  try {
-    final res = await _client
-        .get(Uri.parse(kInstanceListUrl))
-        .timeout(const Duration(seconds: 5));
-    if (res.statusCode == 200) {
-      final data = jsonDecode(res.body) as List;
-      var added = 0;
-      for (final entry in data) {
-        // Format: [name, apiUrl, locations, cdnEnabled]
-        if (entry is List && entry.length >= 2) {
-          final apiUrl = entry[1] as String?;
-          if (apiUrl != null && apiUrl.startsWith('http')) {
-            if (merged.add(apiUrl)) added++;
-          }
-        }
-      }
-      log('  [instances] live list fetched OK, +$added naye instances');
-    } else {
-      log('  [instances] live list -> HTTP ${res.statusCode}, static list use karenge');
-    }
-  } catch (e) {
-    log('  [instances] live list fetch failed ($e), static list use karenge');
-  }
-  final list = merged.toList();
-  log('  [instances] total ${list.length} candidates race ke liye');
-  return list;
-}
-
-// ---------------- Generic parallel race helper ----------------
-//
-// Sabhi instances ko EK SAATH try karta hai (sequential nahi). Jo pehla
-// successful result deta hai wahi return hota hai; baaki ke abhi-chal-rahe
-// attempts ignore kar diye jaate hain (Dart me true cancel possible nahi
-// hai http client ke liye, lekin hum unke result ka wait nahi karte).
-Future<T?> raceFirstSuccess<T>(
-  List<String> instances,
-  Future<T?> Function(String base) attempt,
-) async {
-  if (instances.isEmpty) return null;
-  final completer = Completer<T?>();
-  var remaining = instances.length;
-
-  for (final base in instances) {
-    attempt(base).then((result) {
-      if (completer.isCompleted) return;
-      if (result != null) {
-        completer.complete(result);
-      } else {
-        remaining--;
-        if (remaining == 0 && !completer.isCompleted) {
-          completer.complete(null);
-        }
-      }
-    }).catchError((e) {
-      if (completer.isCompleted) return;
-      remaining--;
-      if (remaining == 0 && !completer.isCompleted) {
-        completer.complete(null);
-      }
-    });
-  }
-
-  return completer.future;
-}
 
 // ---------------- Search ----------------
 
-Future<List<Map<String, dynamic>>?> _searchOne(String base, String query) async {
-  log('  [search] trying $base ...');
+Future<List<Map<String, dynamic>>> search(YoutubeExplode yt, String query) async {
+  log('  [search] querying YouTube directly for "$query" ...');
   try {
-    final uri = Uri.parse('$base/search').replace(queryParameters: {
-      'q': query,
-      'filter': 'music_songs',
-    });
-    final res = await _client.get(uri).timeout(const Duration(seconds: 8));
-    if (res.statusCode != 200) {
-      log('  [search] $base -> HTTP ${res.statusCode}');
-      return null;
-    }
-    final data = jsonDecode(res.body) as Map<String, dynamic>;
-    final items = (data['items'] as List?) ?? [];
-    final results = <Map<String, dynamic>>[];
-    for (final it in items) {
-      final map = it as Map<String, dynamic>;
-      final rawUrl = map['url'] as String?;
-      if (rawUrl == null) continue;
-      final id = Uri.parse(rawUrl).queryParameters['v'];
-      if (id == null || id.isEmpty) continue;
-      results.add({
-        'id': id,
-        'title': map['title'],
-        'author': map['uploaderName'],
-        'duration': map['duration'],
-      });
-    }
-    if (results.isEmpty) {
-      log('  [search] $base -> 0 results');
-      return null;
-    }
-    log('  [search] $base -> OK, ${results.length} results');
-    return results;
+    final results = await yt.search.getVideos(query);
+    final list = results
+        .take(10)
+        .map((v) => {
+              'id': v.id.value,
+              'title': v.title,
+              'author': v.author,
+              'duration': v.duration?.inSeconds,
+            })
+        .toList();
+    log('  [search] OK, ${list.length} results');
+    return list;
   } catch (e) {
-    log('  [search] $base -> error: $e');
-    return null;
+    log('  [search] error: $e');
+    return [];
   }
-}
-
-Future<List<Map<String, dynamic>>> search(
-    String query, List<String> instances) async {
-  final result = await raceFirstSuccess<List<Map<String, dynamic>>>(
-    instances,
-    (base) => _searchOne(base, query),
-  );
-  return result ?? [];
 }
 
 // ---------------- Verify a candidate URL is actually fetchable ----------------
@@ -190,11 +74,11 @@ Future<List<Map<String, dynamic>>> search(
 Future<bool> verifyPlayable(String url) async {
   HttpClient? client;
   try {
-    client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+    client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
     final request =
-        await client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 6));
+        await client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 8));
     request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1023');
-    final response = await request.close().timeout(const Duration(seconds: 6));
+    final response = await request.close().timeout(const Duration(seconds: 8));
     await response.drain<List<int>>();
     return response.statusCode == 200 || response.statusCode == 206;
   } catch (e) {
@@ -207,44 +91,37 @@ Future<bool> verifyPlayable(String url) async {
 
 // ---------------- Audio URL resolve ----------------
 
-Future<String?> _audioOne(String base, String videoId) async {
-  log('  [audio] trying $base ...');
+Future<String?> getAudioUrl(YoutubeExplode yt, String videoId) async {
   try {
-    final uri = Uri.parse('$base/streams/$videoId');
-    final res = await _client.get(uri).timeout(const Duration(seconds: 10));
-    if (res.statusCode != 200) {
-      log('  [audio] $base -> HTTP ${res.statusCode}');
-      return null;
-    }
-    final data = jsonDecode(res.body) as Map<String, dynamic>;
-    final audioStreams = (data['audioStreams'] as List?) ?? [];
+    log('  [audio] resolving manifest for $videoId ...');
+    final manifest = await yt.videos.streams.getManifest(
+      videoId,
+      // Multiple clients try karo taaki agar ek client challenge/block ho
+      // to doosra kaam kar jaaye — Piped-style instance-fallback ka
+      // equivalent, lekin ab YouTube ke apne alag-alag client surfaces par.
+      ytClients: [
+        YoutubeApiClient.ios,
+        YoutubeApiClient.androidVr,
+        YoutubeApiClient.safari,
+      ],
+    );
+    final audioStreams = manifest.audioOnly;
     if (audioStreams.isEmpty) {
-      log('  [audio] $base -> no audioStreams');
+      log('  [audio] no audio-only streams in manifest');
       return null;
     }
-    final sorted = List<Map<String, dynamic>>.from(audioStreams)
-      ..sort((a, b) =>
-          ((b['bitrate'] as num?) ?? 0).compareTo((a['bitrate'] as num?) ?? 0));
-    final url = sorted.first['url'] as String?;
-    if (url == null) {
-      log('  [audio] $base -> best stream has no url');
+    final best = audioStreams.withHighestBitrate();
+    log('  [audio] best candidate: ${best.bitrate}, verifying with real fetch...');
+    if (!await verifyPlayable(best.url.toString())) {
+      log('  [audio] verify FAILED');
       return null;
     }
-    log('  [audio] $base -> verifying with real fetch...');
-    if (!await verifyPlayable(url)) {
-      log('  [audio] $base -> verify FAILED');
-      return null;
-    }
-    log('  [audio] $base -> OK!');
-    return url;
+    log('  [audio] OK!');
+    return best.url.toString();
   } catch (e) {
-    log('  [audio] $base -> error: $e');
+    log('  [audio] error: $e');
     return null;
   }
-}
-
-Future<String?> getAudioUrl(String videoId, List<String> instances) async {
-  return raceFirstSuccess<String>(instances, (base) => _audioOne(base, videoId));
 }
 
 // ---------------- Main ----------------
@@ -257,31 +134,39 @@ Future<void> main(List<String> args) async {
 
   var failed = false;
 
-  log('===== STEP 0: resolve instances (dynamic + static) =====');
-  final instances = await resolveInstances();
+  log('===== SETUP: init Deno JS solver (kuch clients ko cipher-challenge solve karna padta hai) =====');
+  YoutubeExplode yt;
+  try {
+    final solver = await DenoEJSSolver.init();
+    yt = YoutubeExplode(jsSolver: solver);
+    log('  [setup] Deno solver ready');
+  } catch (e) {
+    log('  [setup] Deno solver init failed ($e) — bina solver ke aage badh rahe hain (kuch streams skip ho sakte hain)');
+    yt = YoutubeExplode();
+  }
 
   log('');
-  log('===== TEST 1: search("$query") — parallel race across ${instances.length} instances =====');
-  final results = await search(query, instances);
+  log('===== TEST 1: search("$query") =====');
+  final results = await search(yt, query);
   if (results.isEmpty) {
-    log('RESULT: FAIL — saare instances se 0 results');
+    log('RESULT: FAIL — 0 results');
     failed = true;
   } else {
     log('RESULT: PASS — ${results.length} results, pehla: ${results.first}');
   }
 
   log('');
-  log('===== TEST 2: getAudioUrl("$videoId") — parallel race =====');
-  final url = await getAudioUrl(videoId, instances);
+  log('===== TEST 2: getAudioUrl("$videoId") =====');
+  final url = await getAudioUrl(yt, videoId);
   if (url == null) {
-    log('RESULT: FAIL — koi bhi instance se playable URL nahi mila');
+    log('RESULT: FAIL — playable audio URL resolve nahi hua');
     failed = true;
   } else {
     final shown = url.length > 100 ? '${url.substring(0, 100)}...' : url;
     log('RESULT: PASS — $shown');
   }
 
-  _client.close();
+  yt.close();
 
   log('');
   if (failed) {
