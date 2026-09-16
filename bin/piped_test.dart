@@ -114,20 +114,15 @@ Future<List<Map<String, dynamic>>> search(YoutubeExplode yt, String query) async
 // =====================================================================
 
 Future<bool> verifyPlayable(String url) async {
-  HttpClient? client;
   try {
-    client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
-    final request =
-        await client.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 8));
-    request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1023');
-    final response = await request.close().timeout(const Duration(seconds: 8));
-    await response.drain<List<int>>();
-    return response.statusCode == 200 || response.statusCode == 206;
+    final res = await _httpClient.get(
+      Uri.parse(url),
+      headers: {'Range': 'bytes=0-1023'},
+    ).timeout(const Duration(seconds: 8));
+    return res.statusCode == 200 || res.statusCode == 206;
   } catch (e) {
     log('  [verify] failed: $e');
     return false;
-  } finally {
-    client?.close(force: true);
   }
 }
 
