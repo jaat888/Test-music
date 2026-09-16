@@ -1,0 +1,19 @@
+name: Test Piped Logic
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dart-lang/setup-dart@v1
+
+      - name: Pub get
+        run: dart pub get
+
+      - name: Run test
+        run: dart run bin/piped_test.dart
