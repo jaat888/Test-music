@@ -127,8 +127,41 @@ Future<bool> verifyPlayable(String url) async {
 }
 
 // =====================================================================
-// AUDIO URL — Layer 1: youtube_explode_dart
+// videoId sanity check + self-heal
 // =====================================================================
+//
+// dart_ytmusic_api khud "early development, may be unstable" bolta hai —
+// dekha gaya ki iska videoId field kabhi-kabhi corrupt/wrong nikalta hai
+// (title/author sahi hote hain, par ID exist hi nahi karta asli YouTube
+// par). Isliye streaming ke liye use karne se pehle ID ko verify karo;
+// agar galat nikle to title+author se ek fresh, guaranteed-real explode
+// search karke sahi ID le lo.
+Future<String?> resolvePlayableVideoId(
+  YoutubeExplode yt,
+  String candidateId,
+  String? title,
+  String? author,
+) async {
+  try {
+    await yt.videos.get(candidateId);
+    return candidateId; // valid hai, isi ko use karo
+  } catch (e) {
+    log('  [id-check] "$candidateId" invalid ($e) — YT Music ka ID kharab nikla');
+  }
+  if (title == null) return null;
+  final requery = author != null ? '$title $author' : title;
+  log('  [id-check] "$requery" ke liye fresh explode search se real ID dhoondh rahe hain...');
+  try {
+    final results = await yt.search.getVideos(requery);
+    if (results.isEmpty) return null;
+    final realId = results.first.id.value;
+    log('  [id-check] real ID mila: $realId');
+    return realId;
+  } catch (e) {
+    log('  [id-check] fallback search bhi fail: $e');
+    return null;
+  }
+}
 
 Future<String?> _audioViaExplode(YoutubeExplode yt, String videoId) async {
   try {
@@ -312,12 +345,23 @@ Future<void> main(List<String> args) async {
   // result ka ID test karo — hardcoded "hamesha available" test video
   // (Rick Astley) real Bollywood/label gaano jitna protected nahi hota,
   // isliye wo PASS hoke bhi asli gaane fail hone wala bug chhupa deta tha. ***
-  videoId ??= (results.isNotEmpty ? results.first['id'] as String? : null) ??
-      kTestVideoId;
+  String? title;
+  String? author;
+  if (videoId == null && results.isNotEmpty) {
+    videoId = results.first['id'] as String?;
+    title = results.first['title'] as String?;
+    author = results.first['author'] as String?;
+  }
+  videoId ??= kTestVideoId;
 
   log('');
-  log('===== TEST 2: getAudioUrl("$videoId") — REAL search-result song =====');
-  final url = await getAudioUrl(yt, videoId);
+  log('===== STEP: videoId sanity check =====');
+  final verifiedId =
+      await resolvePlayableVideoId(yt, videoId, title, author) ?? videoId;
+
+  log('');
+  log('===== TEST 2: getAudioUrl("$verifiedId") — REAL search-result song =====');
+  final url = await getAudioUrl(yt, verifiedId);
   if (url == null) {
     log('RESULT: FAIL — dono layers (explode + Piped backup) se playable URL nahi mila');
     failed = true;
